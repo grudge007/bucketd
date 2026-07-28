@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bucketd/internal/model"
 	"database/sql"
 	"fmt"
 	"log"
@@ -32,6 +33,19 @@ func (d *Repository) InsertBucket(name, owner string) error {
 	if err != nil {
 		return err
 	}
-	return nil
 
+	return nil
+}
+
+func (d *Repository) InsertObject(object model.Object) error {
+	if object.StorageClass == "" {
+		object.StorageClass = "STANDARD"
+	}
+	query := `INSERT INTO objects (bucket_name, key, size, etag, storage_class, created_by) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := d.DB.Exec(query, object.BucketName, object.Key, object.Size, object.Etag, object.StorageClass, object.CreatedBy)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
