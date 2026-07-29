@@ -4,7 +4,9 @@ import (
 	"bucketd/internal/handler"
 	"bucketd/internal/model"
 	"context"
+	"database/sql"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,6 +22,11 @@ type Controller struct {
 type contextKey string
 
 const userIDKey contextKey = "user_id"
+
+var (
+	ErrNoSuchBucket = errors.New("bucket does not exist")
+	ErrAccessDenied = errors.New("access denied")
+)
 
 func NewController(handler *handler.Handler) *Controller {
 	return &Controller{
@@ -69,7 +76,7 @@ func (c *Controller) UploadObjectController(w http.ResponseWriter, r *http.Reque
 		Key:        objectKey,
 		CreatedBy:  userID,
 	}
-	etag, err := c.Handler.AddObjectToBucketHandler(object, r.Body)
+	etag, err := c.Handler.AddObjectHandler(object, r.Body)
 	if err != nil {
 		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
 		return
@@ -79,6 +86,79 @@ func (c *Controller) UploadObjectController(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
 	w.WriteHeader(http.StatusOK)
+}
+
+func (c *Controller) DeleteObjectController(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("bucket")
+	key := r.PathValue("key")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	err := c.Handler.DeleteObjectHandler(bucketName, key, userId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist", r.URL.Path)
+			return
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
+			return
+		}
+
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *Controller) ListBucketsController(w http.ResponseWriter, r *http.Request) {
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	resp, err := c.Handler.ListBucketsHandler(userId)
+	if err != nil {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), userId)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	xml.NewEncoder(w).Encode(resp)
+}
+
+func (c *Controller) ListObjectsController(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("list-type") != "2" {
+		sendS3Error(w, http.StatusBadRequest, "InvalidArgument", "Unsupported list-type parameter", r.URL.Path)
+		return
+	}
+
+	bucketName := r.PathValue("bucket")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	resp, err := c.Handler.ListObjectsHandler(userId, bucketName)
+	if err != nil {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), userId)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	xml.NewEncoder(w).Encode(resp)
 }
 
 func JWTAuthMiddleware(jwtSecret []byte, next http.HandlerFunc) http.HandlerFunc {
