@@ -62,6 +62,24 @@ bucketd/
 - **Go**: 1.22 or higher
 - **SQLite3 / CGO**: Required for `github.com/mattn/go-sqlite3`
 
+### Configuration
+
+Create a `.env` file in the root directory (or copy `.env.example`):
+
+```env
+PORT=7071
+JWT_SECRET=your-secret-key-here
+STORAGE_ROOT=./storage
+DB_PATH=file:./tests/bucketd.db?_foreign_keys=on
+```
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PORT` | HTTP port the server listens on | `7071` |
+| `JWT_SECRET` | Secret key for verifying JWT tokens | `97126c91-2838-45c1-a017-8e22dac15fd0` |
+| `STORAGE_ROOT` | Directory path for payload storage | `./tests/objectd` |
+| `DB_PATH` | SQLite DSN connection string | `file:./tests/bucketd.db?_foreign_keys=on` |
+
 ### Building the Server
 
 ```bash

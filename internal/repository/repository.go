@@ -23,8 +23,11 @@ var (
 	ErrBucketAlreadyExists = errors.New("the requested bucket name already exists")
 )
 
-func NewRepository() *Repository {
-	db, err := sql.Open("sqlite3", "file:/home/iamgrudge/Configs/PE/portfolio/bucketd/tests/bucketd.db?_foreign_keys=on")
+func NewRepository(dbPath string) *Repository {
+	if dbPath == "" {
+		dbPath = "file:/home/iamgrudge/Configs/PE/portfolio/bucketd/tests/bucketd.db?_foreign_keys=on"
+	}
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		fmt.Println(err)
 		log.Fatal("Error: DB Connection Failed")
