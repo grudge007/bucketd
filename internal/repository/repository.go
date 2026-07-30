@@ -152,3 +152,70 @@ func (r *Repository) ListObjects(ownerId, bucketName string) ([]model.Content, e
 
 	return objects, nil
 }
+
+func (r *Repository) ValidateBucketEmpty(bucketName string) (bool, error) {
+	// Query returns 1 if at least one object exists, 0 if empty
+	query := `SELECT EXISTS(SELECT 1 FROM objects WHERE bucket_name = ?)`
+
+	var exists bool
+	err := r.DB.QueryRow(query, bucketName).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if bucket is empty: %w", err)
+	}
+
+	// If exists is true, the bucket is NOT empty
+	isEmpty := !exists
+	return isEmpty, nil
+}
+
+func (r *Repository) DeleteBucket(bucketName string) error {
+	query := `DELETE FROM buckets WHERE name = ?`
+	_, err := r.DB.Exec(query, bucketName)
+	return err
+}
+
+func (r *Repository) GetObjectRecord(bucketName, key string) (*model.Object, error) {
+	query := `
+        SELECT bucket_name, key, size, etag, storage_class, created_by, last_modified 
+        FROM objects 
+        WHERE bucket_name = ? AND key = ?
+    `
+
+	var obj model.Object
+	err := r.DB.QueryRow(query, bucketName, key).Scan(
+		&obj.BucketName,
+		&obj.Key,
+		&obj.Size,
+		&obj.Etag,
+		&obj.StorageClass,
+		&obj.CreatedBy,
+		&obj.LastModified,
+	)
+	if err != nil {
+		return nil, err // Returns sql.ErrNoRows if key doesn't exist
+	}
+
+	return &obj, nil
+}
+
+func (r *Repository) GetObjectMetadata(bucketName, key string) (*model.Object, error) {
+	query := `
+        SELECT key, size, etag, storage_class, last_modified 
+        FROM objects 
+        WHERE bucket_name = ? AND key = ?
+    `
+
+	var obj model.Object
+	err := r.DB.QueryRow(query, bucketName, key).Scan(
+		&obj.Key,
+		&obj.Size,
+		&obj.Etag,
+		&obj.StorageClass,
+		&obj.LastModified,
+	)
+	if err != nil {
+		return nil, err // Returns sql.ErrNoRows if key doesn't exist
+	}
+
+	return &obj, nil
+}

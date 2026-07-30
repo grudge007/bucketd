@@ -3,16 +3,15 @@ package controller
 import (
 	"bucketd/internal/handler"
 	"bucketd/internal/model"
-	"context"
 	"database/sql"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"strings"
-
-	"github.com/golang-jwt/jwt/v5"
+	"os"
+	"strconv"
 )
 
 type Controller struct {
@@ -24,14 +23,28 @@ type contextKey string
 const userIDKey contextKey = "user_id"
 
 var (
-	ErrNoSuchBucket = errors.New("bucket does not exist")
-	ErrAccessDenied = errors.New("access denied")
+	ErrNoSuchBucket   = errors.New("bucket does not exist")
+	ErrAccessDenied   = errors.New("access denied")
+	ErrBucketNotEmpty = errors.New("the specified bucket is not empty")
+	ErrNoSuchKey      = errors.New("the specified key does not exist")
 )
 
 func NewController(handler *handler.Handler) *Controller {
 	return &Controller{
 		Handler: handler,
 	}
+}
+
+func sendS3Error(w http.ResponseWriter, status int, code, message, resource string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	w.Write([]byte(xml.Header))
+	xml.NewEncoder(w).Encode(model.S3Error{
+		Code:      code,
+		Message:   message,
+		Resource:  resource,
+		RequestId: "tx000000000000000000001",
+	})
 }
 
 func (c *Controller) CreateBucketController(w http.ResponseWriter, r *http.Request) {
@@ -161,65 +174,145 @@ func (c *Controller) ListObjectsController(w http.ResponseWriter, r *http.Reques
 	xml.NewEncoder(w).Encode(resp)
 }
 
-func JWTAuthMiddleware(jwtSecret []byte, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Missing or invalid authorization header.", r.URL.Path)
+func (c *Controller) DeleteBucketController(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("bucket")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	err := c.Handler.DeleteBucketHandler(bucketName, userId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.", r.URL.Path)
+			return
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
+			return
+		}
+		if errors.Is(err, ErrBucketNotEmpty) {
+			sendS3Error(w, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.", r.URL.Path)
 			return
 		}
 
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
-			// Check algorithm name directly
-			if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return jwtSecret, nil
-		})
-
-		if err != nil || !token.Valid {
-			log.Println("failed here: ", err)
-			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Missing or invalid authorization header.", r.URL.Path)
-			return
-		}
-
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok {
-			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Missing or invalid authorization header.", r.URL.Path)
-			return
-		}
-
-		// 1. Extract using "UserID" key
-		val, ok := claims[string(userIDKey)]
-		if !ok {
-			// log.Println("failed here: ", err)
-			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Missing or invalid authorization header.", r.URL.Path)
-			return
-		}
-
-		userID, ok := val.(string)
-		if !ok || userID == "" {
-			log.Println("failed here: ", err)
-			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Missing or invalid authorization header.", r.URL.Path)
-			return
-		}
-
-		// 2. Attach using typed context key (userIDKey), NOT string variable
-		ctx := context.WithValue(r.Context(), userIDKey, userID)
-		next(w, r.WithContext(ctx))
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
+		return
 	}
 }
 
-func sendS3Error(w http.ResponseWriter, status int, code, message, resource string) {
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(status)
-	w.Write([]byte(xml.Header))
-	xml.NewEncoder(w).Encode(model.S3Error{
-		Code:      code,
-		Message:   message,
-		Resource:  resource,
-		RequestId: "tx000000000000000000001",
-	})
+func (c *Controller) GetObjectController(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("")
+
+	key := r.PathValue("key")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	objectpath, object, err := c.Handler.GetObjectHandler(bucketName, key, userId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.", r.URL.Path)
+			return
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
+			return
+		}
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
+		return
+	}
+
+	file, err := os.Open(objectpath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist on disk.", r.URL.Path)
+			return
+		}
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
+		return
+	}
+	defer file.Close()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
+	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, object.Etag))
+	w.Header().Set("Last-Modified", object.LastModified)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.Copy(w, file); err != nil {
+		// Log connection breaks (e.g. client canceled download early)
+		log.Printf("Error streaming file %s to client: %v", key, err)
+	}
+
+}
+
+func (c *Controller) ValidateBucketExistenceController(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("bucket")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	err := c.Handler.ValidateBucketExistenceHandler(bucketName, userId)
+	if err != nil {
+		if errors.Is(err, ErrNoSuchBucket) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", err.Error(), r.URL.Path)
+			return
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+			return
+		}
+
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
+		return
+	}
+
+	// Success response for HEAD / Bucket check -> 200 OK with no body
+	w.WriteHeader(http.StatusOK)
+}
+
+func (c *Controller) GetObjectMetadataController(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.PathValue("bucket")
+
+	key := r.PathValue("key")
+
+	userId, ok := r.Context().Value(userIDKey).(string)
+	if !ok {
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", "Missing user context", r.URL.Path)
+		return
+	}
+
+	object, err := c.Handler.GetObjectMetadataHandler(bucketName, key, userId)
+	if err != nil {
+		if errors.Is(err, ErrAccessDenied) {
+			w.WriteHeader(http.StatusForbidden) // 403 (No body for HEAD)
+			return
+		}
+
+		if errors.Is(err, ErrNoSuchBucket) {
+			w.WriteHeader(http.StatusNotFound) // 404 (No body for HEAD)
+			return
+		}
+
+		w.WriteHeader(http.StatusInternalServerError) // 500
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
+	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, object.Etag))
+	w.Header().Set("Last-Modified", object.LastModified)
+
+	w.WriteHeader(http.StatusOK)
 }

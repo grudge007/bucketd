@@ -32,10 +32,10 @@ func main() {
 	mux.HandleFunc("GET /", controller.JWTAuthMiddleware([]byte(jwtKey), c.ListBucketsController))
 
 	// Head Bucket (Check if bucket exists)
-	// mux.HandleFunc("HEAD /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.HeadBucketController))
+	mux.HandleFunc("HEAD /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.ValidateBucketExistenceController))
 
 	// Delete Bucket
-	// mux.HandleFunc("DELETE /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.DeleteBucketController))
+	mux.HandleFunc("DELETE /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.DeleteBucketController))
 
 	// --- Object Management ---
 	// Add / Upload Object
@@ -45,10 +45,10 @@ func main() {
 	mux.HandleFunc("GET /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.ListObjectsController))
 
 	// Get / Download Object
-	// mux.HandleFunc("GET /{bucket}/{key...}", controller.JWTAuthMiddleware([]byte(jwtKey), c.GetObjectController))
+	mux.HandleFunc("GET /{bucket}/{key...}", controller.JWTAuthMiddleware([]byte(jwtKey), c.GetObjectController))
 
 	// Head Object (Get object metadata headers)
-	// mux.HandleFunc("HEAD /{bucket}/{key...}", controller.JWTAuthMiddleware([]byte(jwtKey), c.HeadObjectController))
+	mux.HandleFunc("HEAD /{bucket}/{key...}", controller.JWTAuthMiddleware([]byte(jwtKey), c.GetObjectMetadataController))
 
 	// Delete Object
 	mux.HandleFunc("DELETE /{bucket}/{key...}", controller.JWTAuthMiddleware([]byte(jwtKey), c.DeleteObjectController))

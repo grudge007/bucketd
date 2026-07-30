@@ -22,6 +22,7 @@ type Object struct {
 	Etag         string
 	StorageClass string
 	CreatedBy    string
+	LastModified string
 }
 
 type Owner struct {

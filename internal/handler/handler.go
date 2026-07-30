@@ -6,12 +6,20 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"time"
+)
+
+var (
+	ErrBucketNotEmpty = errors.New("the specified bucket is not empty")
+	ErrNoSuchBucket   = errors.New("the specified bucket does not exist")
+	ErrAccessDenied   = errors.New("access denied")
+	ErrNoSuchKey      = errors.New("the specified key does not exist")
 )
 
 type Handler struct {
@@ -37,7 +45,7 @@ func (h *Handler) CreateBucketHandler(bucketName, ownerId string) error {
 		return fmt.Errorf("failed to create bucket: %v", err)
 	}
 
-	err = os.MkdirAll(filepath.Join(h.Root, bucketName), 0666)
+	err = os.MkdirAll(filepath.Join(h.Root, bucketName), 0755)
 	if err != nil {
 		log.Println("failed to create dir: ", err)
 		return fmt.Errorf("failed to create bucket: %v", err)
@@ -159,4 +167,91 @@ func (h *Handler) ListObjectsHandler(ownerId, bucketName string) (model.ListObje
 		Contents:    objects,
 	}
 	return resp, nil
+}
+
+func (h *Handler) DeleteBucketHandler(bucketName, ownerId string) error {
+	if err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId); err != nil {
+		return err
+	}
+
+	isEmpty, err := h.Repository.ValidateBucketEmpty(bucketName)
+	if err != nil {
+		return fmt.Errorf("failed to check if bucket is empty: %w", err)
+	}
+
+	if !isEmpty {
+		return ErrBucketNotEmpty
+	}
+
+	if err := h.Repository.DeleteBucket(bucketName); err != nil {
+		return fmt.Errorf("failed to delete bucket record: %w", err)
+	}
+
+	bucketPath := filepath.Join(h.Root, bucketName)
+	if err := os.Remove(bucketPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to delete bucket directory %s: %v", bucketPath, err)
+	}
+
+	return nil
+}
+
+func (h *Handler) GetObjectHandler(bucketName, key, userID string) (string, *model.Object, error) {
+	// A. Validate user permissions for the bucket
+	if err := h.Repository.ValidateUserAgainstBucket(bucketName, userID); err != nil {
+		return "", nil, err
+	}
+
+	// B. Get metadata from database
+	obj, err := h.Repository.GetObjectRecord(bucketName, key)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// C. Resolve file path on disk
+	filePath := filepath.Join(h.Root, bucketName, key)
+
+	return filePath, obj, nil
+}
+
+func (h *Handler) ValidateBucketExistenceHandler(bucketName, ownerId string) error {
+	err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Bucket doesn't exist in DB
+			return ErrNoSuchBucket
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			// Bucket exists, but belongs to another user
+			return ErrAccessDenied
+		}
+		return fmt.Errorf("database validation error: %w", err)
+	}
+
+	return nil
+}
+
+func (h *Handler) GetObjectMetadataHandler(bucketName, key, ownerId string) (*model.Object, error) {
+	err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Bucket doesn't exist in DB
+			return nil, ErrNoSuchBucket
+		}
+		if errors.Is(err, ErrAccessDenied) {
+			// Bucket exists, but belongs to another user
+			return nil, ErrAccessDenied
+		}
+		return nil, fmt.Errorf("database validation error: %w", err)
+	}
+
+	object, err := h.Repository.GetObjectMetadata(bucketName, key)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoSuchKey
+		}
+
+		return nil, err
+	}
+
+	return object, nil
 }
