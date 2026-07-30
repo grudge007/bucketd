@@ -12,14 +12,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 var (
-	ErrBucketNotEmpty = errors.New("the specified bucket is not empty")
-	ErrNoSuchBucket   = errors.New("the specified bucket does not exist")
-	ErrAccessDenied   = errors.New("access denied")
-	ErrNoSuchKey      = errors.New("the specified key does not exist")
+	ErrBucketNotEmpty = repository.ErrBucketNotEmpty
+	ErrNoSuchBucket   = repository.ErrNoSuchBucket
+	ErrAccessDenied   = repository.ErrAccessDenied
+	ErrNoSuchKey      = repository.ErrNoSuchKey
 )
 
 type Handler struct {
@@ -38,68 +39,90 @@ func NewHandler(repository *repository.Repository, root string) *Handler {
 	}
 }
 
+func (h *Handler) getSafeObjectPath(bucketName, key string) (string, error) {
+	bucketDir := filepath.Clean(filepath.Join(h.Root, bucketName))
+	filePath := filepath.Clean(filepath.Join(bucketDir, key))
+
+	rel, err := filepath.Rel(bucketDir, filePath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		return "", fmt.Errorf("invalid object key path")
+	}
+
+	return filePath, nil
+}
+
 func (h *Handler) CreateBucketHandler(bucketName, ownerId string) error {
 	err := h.Repository.InsertBucket(bucketName, ownerId)
 	if err != nil {
 		log.Println("failed to insert data into bucket table: ", err)
-		return fmt.Errorf("failed to create bucket: %v", err)
+		return err
 	}
 
 	err = os.MkdirAll(filepath.Join(h.Root, bucketName), 0755)
 	if err != nil {
+		_ = h.Repository.DeleteBucket(bucketName) // Roll back DB insert on disk creation failure
 		log.Println("failed to create dir: ", err)
-		return fmt.Errorf("failed to create bucket: %v", err)
+		return fmt.Errorf("failed to create bucket directory: %v", err)
 	}
 	return nil
 }
 
 func (h *Handler) AddObjectHandler(object model.Object, body io.Reader) (string, error) {
-	filePath := filepath.Join(h.Root, object.BucketName, object.Key)
+	// 1. Validate bucket existence and user authorization
+	if err := h.Repository.ValidateUserAgainstBucket(object.BucketName, object.CreatedBy); err != nil {
+		return "", err
+	}
+
+	// 2. Validate object path for directory traversal
+	filePath, err := h.getSafeObjectPath(object.BucketName, object.Key)
+	if err != nil {
+		return "", err
+	}
+
 	filePathTmp := fmt.Sprintf("%s.tmp.%d", filePath, time.Now().UnixNano())
 
-	// 1. Ensure parent directories exist (0755 gives proper execution/traversal permissions)
+	// 3. Ensure parent directories exist
 	if err := os.MkdirAll(filepath.Dir(filePathTmp), 0755); err != nil {
 		return "", fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
-	// 2. Create the temp file on disk
+	// 4. Create the temp file on disk
 	outFile, err := os.Create(filePathTmp)
 	if err != nil {
 		return "", fmt.Errorf("failed to create file on disk: %w", err)
 	}
 
 	// Cleanup hook: Runs on function exit.
-	// If the file was already closed or renamed, os.Remove safely returns an error we ignore.
 	defer func() {
 		outFile.Close()
-		os.Remove(filePathTmp) // Deletes tmp file if an error returned before os.Rename
+		os.Remove(filePathTmp)
 	}()
 
-	// 3. Initialize MD5 hasher & MultiWriter
+	// 5. Initialize MD5 hasher & MultiWriter
 	hasher := md5.New()
 	mw := io.MultiWriter(outFile, hasher)
 
-	// 4. Stream body to temp file and hasher simultaneously
+	// 6. Stream body to temp file and hasher simultaneously
 	object.Size, err = io.Copy(mw, body)
 	if err != nil {
 		return "", fmt.Errorf("failed to write object content to disk: %w", err)
 	}
 
-	// 5. Compute ETag (hex string)
+	// 7. Compute ETag (hex string)
 	object.Etag = hex.EncodeToString(hasher.Sum(nil))
 
-	// 6. Explicitly close file before DB insert & rename so file handles are released
+	// 8. Explicitly close file before DB insert & rename
 	if err := outFile.Close(); err != nil {
 		return "", fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	// 7. Insert metadata into DB
+	// 9. Insert metadata into DB
 	err = h.Repository.InsertObject(object)
 	if err != nil {
 		return "", fmt.Errorf("failed to add object metadata to DB: %w", err)
 	}
 
-	// 8. Atomic Rename: Only overwrites the real path if streaming AND DB insertion succeed!
+	// 10. Atomic Rename
 	if err := os.Rename(filePathTmp, filePath); err != nil {
 		return "", fmt.Errorf("failed to rename temp object file: %w", err)
 	}
@@ -115,12 +138,14 @@ func (h *Handler) DeleteObjectHandler(bucketName, key, userId string) error {
 
 	err = h.Repository.DeleteObject(bucketName, key)
 	if err != nil {
-		return fmt.Errorf("failed to delete object metadata: %w", err)
+		return err
 	}
 
-	objectpath := filepath.Join(h.Root, bucketName, key)
-	if err := os.Remove(objectpath); err != nil && !os.IsNotExist(err) {
-		log.Printf("Warning: failed to remove file on disk: %v", err)
+	objectpath, err := h.getSafeObjectPath(bucketName, key)
+	if err == nil {
+		if err := os.Remove(objectpath); err != nil && !os.IsNotExist(err) {
+			log.Printf("Warning: failed to remove file on disk: %v", err)
+		}
 	}
 
 	return nil
@@ -132,7 +157,6 @@ func (h *Handler) ListBucketsHandler(ownerId string) (model.ListAllMyBucketsResu
 		return model.ListAllMyBucketsResult{}, err
 	}
 
-	// Ensure buckets is an empty slice instead of nil so XML outputs <Buckets></Buckets> rather than omitting it
 	if buckets == nil {
 		buckets = []model.Bucket{}
 	}
@@ -152,9 +176,17 @@ func (h *Handler) ListBucketsHandler(ownerId string) (model.ListAllMyBucketsResu
 }
 
 func (h *Handler) ListObjectsHandler(ownerId, bucketName string) (model.ListObjectsResult, error) {
+	if err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId); err != nil {
+		return model.ListObjectsResult{}, err
+	}
+
 	objects, err := h.Repository.ListObjects(ownerId, bucketName)
 	if err != nil {
 		return model.ListObjectsResult{}, err
+	}
+
+	if objects == nil {
+		objects = []model.Content{}
 	}
 
 	resp := model.ListObjectsResult{
@@ -180,7 +212,7 @@ func (h *Handler) DeleteBucketHandler(bucketName, ownerId string) error {
 	}
 
 	if !isEmpty {
-		return ErrBucketNotEmpty
+		return repository.ErrBucketNotEmpty
 	}
 
 	if err := h.Repository.DeleteBucket(bucketName); err != nil {
@@ -201,14 +233,17 @@ func (h *Handler) GetObjectHandler(bucketName, key, userID string) (string, *mod
 		return "", nil, err
 	}
 
-	// B. Get metadata from database
+	// B. Validate object path for directory traversal
+	filePath, err := h.getSafeObjectPath(bucketName, key)
+	if err != nil {
+		return "", nil, repository.ErrNoSuchKey
+	}
+
+	// C. Get metadata from database
 	obj, err := h.Repository.GetObjectRecord(bucketName, key)
 	if err != nil {
 		return "", nil, err
 	}
-
-	// C. Resolve file path on disk
-	filePath := filepath.Join(h.Root, bucketName, key)
 
 	return filePath, obj, nil
 }
@@ -217,14 +252,12 @@ func (h *Handler) ValidateBucketExistenceHandler(bucketName, ownerId string) err
 	err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Bucket doesn't exist in DB
-			return ErrNoSuchBucket
+			return repository.ErrNoSuchBucket
 		}
-		if errors.Is(err, ErrAccessDenied) {
-			// Bucket exists, but belongs to another user
-			return ErrAccessDenied
+		if errors.Is(err, repository.ErrAccessDenied) {
+			return repository.ErrAccessDenied
 		}
-		return fmt.Errorf("database validation error: %w", err)
+		return err
 	}
 
 	return nil
@@ -234,22 +267,16 @@ func (h *Handler) GetObjectMetadataHandler(bucketName, key, ownerId string) (*mo
 	err := h.Repository.ValidateUserAgainstBucket(bucketName, ownerId)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Bucket doesn't exist in DB
-			return nil, ErrNoSuchBucket
+			return nil, repository.ErrNoSuchBucket
 		}
-		if errors.Is(err, ErrAccessDenied) {
-			// Bucket exists, but belongs to another user
-			return nil, ErrAccessDenied
+		if errors.Is(err, repository.ErrAccessDenied) {
+			return nil, repository.ErrAccessDenied
 		}
-		return nil, fmt.Errorf("database validation error: %w", err)
+		return nil, err
 	}
 
 	object, err := h.Repository.GetObjectMetadata(bucketName, key)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNoSuchKey
-		}
-
 		return nil, err
 	}
 

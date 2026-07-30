@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -15,8 +16,11 @@ type Repository struct {
 }
 
 var (
-	ErrNoSuchBucket = errors.New("the specified bucket does not exist")
-	ErrAccessDenied = errors.New("access denied")
+	ErrNoSuchBucket        = errors.New("the specified bucket does not exist")
+	ErrAccessDenied        = errors.New("access denied")
+	ErrBucketNotEmpty      = errors.New("the specified bucket is not empty")
+	ErrNoSuchKey           = errors.New("the specified key does not exist")
+	ErrBucketAlreadyExists = errors.New("the requested bucket name already exists")
 )
 
 func NewRepository() *Repository {
@@ -37,6 +41,9 @@ func (d *Repository) InsertBucket(name, owner string) error {
 	query := `INSERT INTO buckets (name, owner_id) VALUES (?, ?)`
 	_, err := d.DB.Exec(query, name, owner)
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrBucketAlreadyExists
+		}
 		return err
 	}
 
@@ -47,7 +54,14 @@ func (d *Repository) InsertObject(object model.Object) error {
 	if object.StorageClass == "" {
 		object.StorageClass = "STANDARD"
 	}
-	query := `INSERT INTO objects (bucket_name, key, size, etag, storage_class, created_by) VALUES (?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO objects (bucket_name, key, size, etag, storage_class, created_by, last_modified) 
+	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(bucket_name, key) DO UPDATE SET 
+		size=excluded.size, 
+		etag=excluded.etag, 
+		storage_class=excluded.storage_class, 
+		created_by=excluded.created_by, 
+		last_modified=CURRENT_TIMESTAMP`
 	_, err := d.DB.Exec(query, object.BucketName, object.Key, object.Size, object.Etag, object.StorageClass, object.CreatedBy)
 	if err != nil {
 		return err
@@ -80,13 +94,17 @@ func (r *Repository) ValidateUserAgainstBucket(bucketName, userId string) error 
 func (r *Repository) DeleteObject(bucketName, key string) error {
 	query := `DELETE FROM objects WHERE bucket_name = ? AND key = ?`
 	res, err := r.DB.Exec(query, bucketName, key)
+	if err != nil {
+		return err
+	}
+
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
 
 	if rowsAffected == 0 {
-		return sql.ErrNoRows // Object didn't exist
+		return ErrNoSuchKey // Object didn't exist
 	}
 
 	return nil
@@ -129,7 +147,7 @@ func (r *Repository) ListObjects(ownerId, bucketName string) ([]model.Content, e
 
 	rows, err := r.DB.Query(query, ownerId, bucketName)
 	if err != nil {
-		return nil, fmt.Errorf("querying buckets failed: %w", err)
+		return nil, fmt.Errorf("querying objects failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -140,7 +158,7 @@ func (r *Repository) ListObjects(ownerId, bucketName string) ([]model.Content, e
 
 		err := rows.Scan(&object.Key, &object.ETag, &object.Size, &object.StorageClass, &object.LastModified)
 		if err != nil {
-			return nil, fmt.Errorf("scanning bucket row failed: %w", err)
+			return nil, fmt.Errorf("scanning object row failed: %w", err)
 		}
 
 		objects = append(objects, object)
@@ -192,7 +210,10 @@ func (r *Repository) GetObjectRecord(bucketName, key string) (*model.Object, err
 		&obj.LastModified,
 	)
 	if err != nil {
-		return nil, err // Returns sql.ErrNoRows if key doesn't exist
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoSuchKey
+		}
+		return nil, err
 	}
 
 	return &obj, nil
@@ -214,7 +235,10 @@ func (r *Repository) GetObjectMetadata(bucketName, key string) (*model.Object, e
 		&obj.LastModified,
 	)
 	if err != nil {
-		return nil, err // Returns sql.ErrNoRows if key doesn't exist
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoSuchKey
+		}
+		return nil, err
 	}
 
 	return &obj, nil

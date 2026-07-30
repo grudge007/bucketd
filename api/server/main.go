@@ -29,7 +29,7 @@ func main() {
 	mux.HandleFunc("PUT /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.CreateBucketController))
 
 	// List Buckets
-	mux.HandleFunc("GET /", controller.JWTAuthMiddleware([]byte(jwtKey), c.ListBucketsController))
+	mux.HandleFunc("GET /{$}", controller.JWTAuthMiddleware([]byte(jwtKey), c.ListBucketsController))
 
 	// Head Bucket (Check if bucket exists)
 	mux.HandleFunc("HEAD /{bucket}", controller.JWTAuthMiddleware([]byte(jwtKey), c.ValidateBucketExistenceController))

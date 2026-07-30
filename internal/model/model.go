@@ -40,7 +40,7 @@ type Buckets struct {
 }
 
 type ListAllMyBucketsResult struct {
-	XMLName xml.Name `xml:"ListObjectsResult"`
+	XMLName xml.Name `xml:"ListAllMyBucketsResult"`
 	Xmlns   string   `xml:"xmlns,attr"`
 	Owner   Owner    `xml:"Owner"`
 	Buckets Buckets  `xml:"Buckets"`

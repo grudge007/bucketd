@@ -3,6 +3,7 @@ package controller
 import (
 	"bucketd/internal/handler"
 	"bucketd/internal/model"
+	"bucketd/internal/repository"
 	"database/sql"
 	"encoding/xml"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Controller struct {
@@ -23,16 +25,26 @@ type contextKey string
 const userIDKey contextKey = "user_id"
 
 var (
-	ErrNoSuchBucket   = errors.New("bucket does not exist")
-	ErrAccessDenied   = errors.New("access denied")
-	ErrBucketNotEmpty = errors.New("the specified bucket is not empty")
-	ErrNoSuchKey      = errors.New("the specified key does not exist")
+	ErrNoSuchBucket   = repository.ErrNoSuchBucket
+	ErrAccessDenied   = repository.ErrAccessDenied
+	ErrBucketNotEmpty = repository.ErrBucketNotEmpty
+	ErrNoSuchKey      = repository.ErrNoSuchKey
 )
 
 func NewController(handler *handler.Handler) *Controller {
 	return &Controller{
 		Handler: handler,
 	}
+}
+
+func formatHTTPDate(dt string) string {
+	if t, err := time.Parse("2006-01-02 15:04:05", dt); err == nil {
+		return t.UTC().Format(http.TimeFormat)
+	}
+	if t, err := time.Parse(time.RFC3339, dt); err == nil {
+		return t.UTC().Format(http.TimeFormat)
+	}
+	return dt
 }
 
 func sendS3Error(w http.ResponseWriter, status int, code, message, resource string) {
@@ -57,15 +69,17 @@ func (c *Controller) CreateBucketController(w http.ResponseWriter, r *http.Reque
 
 	err := c.Handler.CreateBucketHandler(bucketName, ownerId)
 	if err != nil {
-		sendS3Error(w, http.StatusConflict, "BucketAlreadyExists", "The requested bucket name already exists.", "/"+bucketName)
+		if errors.Is(err, repository.ErrBucketAlreadyExists) {
+			sendS3Error(w, http.StatusConflict, "BucketAlreadyExists", "The requested bucket name already exists.", "/"+bucketName)
+			return
+		}
+		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), "/"+bucketName)
 		return
-
 	}
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("Location", "/"+bucketName)
 	w.WriteHeader(http.StatusOK)
-
 }
 
 func (c *Controller) UploadObjectController(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +97,6 @@ func (c *Controller) UploadObjectController(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Stream r.Body directly to storage and database
 	object := model.Object{
 		BucketName: bucketName,
 		Key:        objectKey,
@@ -91,11 +104,18 @@ func (c *Controller) UploadObjectController(w http.ResponseWriter, r *http.Reque
 	}
 	etag, err := c.Handler.AddObjectHandler(object, r.Body)
 	if err != nil {
+		if errors.Is(err, repository.ErrNoSuchBucket) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist", r.URL.Path)
+			return
+		}
+		if errors.Is(err, repository.ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
+			return
+		}
 		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
 		return
 	}
 
-	// S3 standard headers for successful object upload
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
 	w.WriteHeader(http.StatusOK)
@@ -113,11 +133,15 @@ func (c *Controller) DeleteObjectController(w http.ResponseWriter, r *http.Reque
 
 	err := c.Handler.DeleteObjectHandler(bucketName, key, userId)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, repository.ErrNoSuchBucket) {
 			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist", r.URL.Path)
 			return
 		}
-		if errors.Is(err, ErrAccessDenied) {
+		if errors.Is(err, repository.ErrNoSuchKey) || errors.Is(err, sql.ErrNoRows) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist", r.URL.Path)
+			return
+		}
+		if errors.Is(err, repository.ErrAccessDenied) {
 			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
 			return
 		}
@@ -164,6 +188,14 @@ func (c *Controller) ListObjectsController(w http.ResponseWriter, r *http.Reques
 
 	resp, err := c.Handler.ListObjectsHandler(userId, bucketName)
 	if err != nil {
+		if errors.Is(err, repository.ErrNoSuchBucket) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist", r.URL.Path)
+			return
+		}
+		if errors.Is(err, repository.ErrAccessDenied) {
+			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
+			return
+		}
 		sendS3Error(w, http.StatusInternalServerError, "InternalError", err.Error(), userId)
 		return
 	}
@@ -185,15 +217,15 @@ func (c *Controller) DeleteBucketController(w http.ResponseWriter, r *http.Reque
 
 	err := c.Handler.DeleteBucketHandler(bucketName, userId)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, repository.ErrNoSuchBucket) || errors.Is(err, sql.ErrNoRows) {
 			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.", r.URL.Path)
 			return
 		}
-		if errors.Is(err, ErrAccessDenied) {
+		if errors.Is(err, repository.ErrAccessDenied) {
 			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
 			return
 		}
-		if errors.Is(err, ErrBucketNotEmpty) {
+		if errors.Is(err, repository.ErrBucketNotEmpty) {
 			sendS3Error(w, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.", r.URL.Path)
 			return
 		}
@@ -204,8 +236,7 @@ func (c *Controller) DeleteBucketController(w http.ResponseWriter, r *http.Reque
 }
 
 func (c *Controller) GetObjectController(w http.ResponseWriter, r *http.Request) {
-	bucketName := r.PathValue("")
-
+	bucketName := r.PathValue("bucket")
 	key := r.PathValue("key")
 
 	userId, ok := r.Context().Value(userIDKey).(string)
@@ -216,11 +247,15 @@ func (c *Controller) GetObjectController(w http.ResponseWriter, r *http.Request)
 
 	objectpath, object, err := c.Handler.GetObjectHandler(bucketName, key, userId)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, repository.ErrNoSuchBucket) {
+			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.", r.URL.Path)
+			return
+		}
+		if errors.Is(err, repository.ErrNoSuchKey) || errors.Is(err, sql.ErrNoRows) {
 			sendS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.", r.URL.Path)
 			return
 		}
-		if errors.Is(err, ErrAccessDenied) {
+		if errors.Is(err, repository.ErrAccessDenied) {
 			sendS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied", r.URL.Path)
 			return
 		}
@@ -242,16 +277,14 @@ func (c *Controller) GetObjectController(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, object.Etag))
-	w.Header().Set("Last-Modified", object.LastModified)
+	w.Header().Set("Last-Modified", formatHTTPDate(object.LastModified))
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := io.Copy(w, file); err != nil {
-		// Log connection breaks (e.g. client canceled download early)
 		log.Printf("Error streaming file %s to client: %v", key, err)
 	}
-
 }
 
 func (c *Controller) ValidateBucketExistenceController(w http.ResponseWriter, r *http.Request) {
@@ -265,11 +298,11 @@ func (c *Controller) ValidateBucketExistenceController(w http.ResponseWriter, r 
 
 	err := c.Handler.ValidateBucketExistenceHandler(bucketName, userId)
 	if err != nil {
-		if errors.Is(err, ErrNoSuchBucket) {
+		if errors.Is(err, repository.ErrNoSuchBucket) {
 			sendS3Error(w, http.StatusNotFound, "NoSuchBucket", err.Error(), r.URL.Path)
 			return
 		}
-		if errors.Is(err, ErrAccessDenied) {
+		if errors.Is(err, repository.ErrAccessDenied) {
 			sendS3Error(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
 			return
 		}
@@ -278,13 +311,11 @@ func (c *Controller) ValidateBucketExistenceController(w http.ResponseWriter, r 
 		return
 	}
 
-	// Success response for HEAD / Bucket check -> 200 OK with no body
 	w.WriteHeader(http.StatusOK)
 }
 
 func (c *Controller) GetObjectMetadataController(w http.ResponseWriter, r *http.Request) {
 	bucketName := r.PathValue("bucket")
-
 	key := r.PathValue("key")
 
 	userId, ok := r.Context().Value(userIDKey).(string)
@@ -295,24 +326,24 @@ func (c *Controller) GetObjectMetadataController(w http.ResponseWriter, r *http.
 
 	object, err := c.Handler.GetObjectMetadataHandler(bucketName, key, userId)
 	if err != nil {
-		if errors.Is(err, ErrAccessDenied) {
-			w.WriteHeader(http.StatusForbidden) // 403 (No body for HEAD)
+		if errors.Is(err, repository.ErrAccessDenied) {
+			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 
-		if errors.Is(err, ErrNoSuchBucket) {
-			w.WriteHeader(http.StatusNotFound) // 404 (No body for HEAD)
+		if errors.Is(err, repository.ErrNoSuchBucket) || errors.Is(err, repository.ErrNoSuchKey) || errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 
-		w.WriteHeader(http.StatusInternalServerError) // 500
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, object.Etag))
-	w.Header().Set("Last-Modified", object.LastModified)
+	w.Header().Set("Last-Modified", formatHTTPDate(object.LastModified))
 
 	w.WriteHeader(http.StatusOK)
 }
